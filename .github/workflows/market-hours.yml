@@ -1,0 +1,35 @@
+name: Trump Trade Alert (Market Hours)
+
+# US stock market: 9:30 AM - 4:00 PM ET.
+# In summer (EDT) that is 13:30 - 20:00 UTC. GitHub cron is always UTC.
+# Runs roughly every 45 minutes, Mon-Fri, across the session.
+# NOTE: in winter (EST) shift each line back 1 hour, or just accept a ~1h edge drift.
+on:
+  schedule:
+    - cron: "30 13 * * 1-5"
+    - cron: "15 14 * * 1-5"
+    - cron: "0 15 * * 1-5"
+    - cron: "45 15 * * 1-5"
+    - cron: "30 16 * * 1-5"
+    - cron: "15 17 * * 1-5"
+    - cron: "0 18 * * 1-5"
+    - cron: "45 18 * * 1-5"
+    - cron: "30 19 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Run Trump Trade Alert (45 min window)
+        env:
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TIME_WINDOW: "45"
+        run: node trump-trade-alert.js

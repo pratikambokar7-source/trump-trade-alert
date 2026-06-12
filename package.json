@@ -1,0 +1,13 @@
+{
+  "name": "trump-trade-alert",
+  "version": "1.0.0",
+  "description": "Monitor Trump Truth Social for market-moving posts via Tavily + Gemini, push to ntfy",
+  "type": "module",
+  "scripts": {
+    "start": "node trump-trade-alert.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {}
+}
