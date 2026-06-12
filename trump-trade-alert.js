@@ -18,7 +18,9 @@ const SOURCES = (process.env.SOURCES ||
   .map((s) => s.trim())
   .filter(Boolean);
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+// Free-tier model (2026): gemini-2.5-flash-lite has the highest free quota
+// (15 RPM, 1,000 req/day). gemini-2.0-flash no longer has free quota.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
 // ---------- Helpers ----------
@@ -153,18 +155,21 @@ No alerts — nothing flagged in the last ${TIME_WINDOW} minutes.`;
 
 // ---------- 3. Push via ntfy ----------
 async function sendNtfy({ title, body, priority, tags }) {
+  // ntfy/Node fetch require Latin1-safe header values. Strip any non-Latin1
+  // chars (e.g. emoji) from the Title; emoji icons come from Tags instead.
+  const safeTitle = String(title).replace(/[^\x00-\xFF]/g, "").trim();
   const res = await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
     method: "POST",
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
-      Title: title,
+      Title: safeTitle,
       Priority: String(priority),
       Tags: tags,
     },
     body,
   });
   if (!res.ok) throw new Error(`ntfy failed (HTTP ${res.status})`);
-  console.log(`📲 Sent: "${title}"`);
+  console.log(`📲 Sent: "${safeTitle}"`);
 }
 
 // ---------- Main ----------
