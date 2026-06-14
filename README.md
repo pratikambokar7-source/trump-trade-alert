@@ -38,6 +38,25 @@ Estimated usage ≈ 440 Tavily credits/month — well inside the free tier.
 
 > DST note: GitHub cron is UTC. `market-hours.yml` is tuned for US summer time (EDT). In winter (EST) the session is 14:30–21:00 UTC; shift each cron line forward 1 hour if you want exact edges.
 
+## Access-controlled (private) topic
+
+The free public `ntfy.sh` has **no access control** — anyone who knows the topic name can read or publish to it. The script already supports authenticated publishing; you just need a server that enforces auth. Two options:
+
+### Option A — ntfy Pro (paid, hosted, easiest)
+1. Sign up at [ntfy.sh](https://ntfy.sh/) and subscribe to ntfy Pro.
+2. Reserve your topic and set access to **"Deny all"** (others get read-only, nobody else can publish).
+3. Create an access token (Account → Access tokens).
+4. Add a repo secret `NTFY_TOKEN` = that token. Leave `NTFY_SERVER` unset (defaults to `https://ntfy.sh`).
+5. Share the topic name with others — they can subscribe and read, but only your token can publish.
+
+### Option B — Self-host ntfy (free-ish, your own VPS)
+1. Run ntfy on a free/cheap VM (e.g. Oracle Cloud free tier) via Docker: `binwiederhier/ntfy`.
+2. In `server.yml`, enable auth and set `auth-default-access: deny-all`.
+3. Create a user/token: `ntfy user add publisher` and `ntfy token add publisher`; grant read-only to others on the topic.
+4. Add repo secrets: `NTFY_SERVER` = `https://your-ntfy-domain`, `NTFY_TOKEN` = the publisher token.
+
+In both cases the script sends `Authorization: Bearer <NTFY_TOKEN>` automatically when `NTFY_TOKEN` is set. If you leave it blank, it behaves exactly as before (public topic).
+
 ## Setup
 
 ### 1. Phone (ntfy)

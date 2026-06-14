@@ -9,6 +9,11 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
+// ntfy server (default public). Point to your self-hosted instance if you have one.
+const NTFY_SERVER = (process.env.NTFY_SERVER || "https://ntfy.sh").replace(/\/+$/, "");
+// Optional access token for an access-controlled / reserved topic (ntfy Pro or
+// self-hosted with auth). When set, publishing is authenticated.
+const NTFY_TOKEN = process.env.NTFY_TOKEN || "";
 
 // Look-back window in minutes. Workflows pass 45 (market hours) / 120 (off hours).
 const TIME_WINDOW = parseInt(process.env.TIME_WINDOW || "120", 10);
@@ -223,14 +228,16 @@ If the post is NOT market-moving, respond with exactly: SKIP`;
 // ---------- 3. Push via ntfy ----------
 async function sendNtfy({ title, body, priority, tags }) {
   const safeTitle = String(title).replace(/[^\x00-\xFF]/g, "").trim();
-  const res = await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
+  const headers = {
+    "Content-Type": "text/plain; charset=utf-8",
+    Title: safeTitle,
+    Priority: String(priority),
+    Tags: tags,
+  };
+  if (NTFY_TOKEN) headers.Authorization = `Bearer ${NTFY_TOKEN}`;
+  const res = await fetch(`${NTFY_SERVER}/${NTFY_TOPIC}`, {
     method: "POST",
-    headers: {
-      "Content-Type": "text/plain; charset=utf-8",
-      Title: safeTitle,
-      Priority: String(priority),
-      Tags: tags,
-    },
+    headers,
     body,
   });
   if (!res.ok) throw new Error(`ntfy failed (HTTP ${res.status})`);
