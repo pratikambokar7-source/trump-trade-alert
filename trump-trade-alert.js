@@ -98,21 +98,42 @@ async function tavilyExtract(url) {
   return results[0].raw_content || "";
 }
 
+// Escape raw control characters that appear INSIDE JSON string literals.
+// Tavily decodes escaped \n/\t into literal newlines/tabs, which strict
+// JSON.parse rejects. We re-escape only chars inside strings, leaving
+// structural whitespace (between tokens) untouched.
+function sanitizeJsonControlChars(str) {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (const ch of str) {
+    if (escaped) { out += ch; escaped = false; continue; }
+    if (ch === "\\") { out += ch; escaped = true; continue; }
+    if (ch === '"') { inString = !inString; out += ch; continue; }
+    const code = ch.charCodeAt(0);
+    if (inString && code < 0x20) {
+      if (ch === "\n") out += "\\n";
+      else if (ch === "\r") out += "\\r";
+      else if (ch === "\t") out += "\\t";
+      else out += "\\u" + code.toString(16).padStart(4, "0");
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 // Pull a JSON value (array or object) out of possibly-noisy extracted text.
 function extractJson(raw) {
   const text = String(raw).trim();
-  try {
-    return JSON.parse(text);
-  } catch (_) {
-    /* fall through to substring salvage */
-  }
   const start = text.search(/[[{]/);
   if (start === -1) throw new Error("No JSON found in Tavily content");
   const open = text[start];
   const close = open === "[" ? "]" : "}";
   const end = text.lastIndexOf(close);
   if (end <= start) throw new Error("Malformed JSON in Tavily content");
-  return JSON.parse(text.slice(start, end + 1));
+  const candidate = sanitizeJsonControlChars(text.slice(start, end + 1));
+  return JSON.parse(candidate);
 }
 
 async function fetchRecentPosts() {
