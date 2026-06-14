@@ -5,16 +5,27 @@ Monitors Donald Trump's Truth Social feed for market-moving posts and pushes ale
 ```
 GitHub Actions (scheduled)
       ↓
-Tavily API → scrapes truthsocial.com/@realDonaldTrump (bypasses 403 IP blocks)
+Tavily API → fetches Truth Social Mastodon API JSON (bypasses 403 IP blocks)
       ↓
-Gemini Flash → analyzes posts for market-moving language
+Code → filters posts to the time window using real created_at timestamps,
+       formats post time in IST, de-dupes by post id (seen.json)
+      ↓
+Gemini Flash → classifies each NEW post as market-moving or not
       ↓
 ntfy.sh → push notification to your phone
 ```
 
-## Why Tavily
+## Why Tavily + the JSON API
 
-GitHub, Cloudflare, Render and most cloud platforms run on data-center IPs that Truth Social blocks (HTTP 403). Tavily fetches through residential proxies, so it gets the real page content. Free tier: 1,000 credits/month.
+GitHub, Cloudflare, Render and most cloud platforms run on data-center IPs that Truth Social blocks (HTTP 403). Tavily fetches through residential proxies, so it reaches the content. We point Tavily at Truth Social's underlying **Mastodon JSON API** (`/api/v1/accounts/{id}/statuses`) rather than the HTML page, so every post comes with a real `created_at` timestamp and a stable `id`. That lets the code — not the LLM — decide what's recent and stamp the correct time, and lets us de-dupe so the same post is never alerted twice. Tavily free tier: 1,000 credits/month.
+
+## De-duplication
+
+`seen.json` stores the IDs of posts already alerted on (last 200). Each scheduled run commits it back to the repo via the workflow (needs `contents: write`, already set). This guarantees no repeat alerts across runs.
+
+## Account id
+
+`TRUTH_ACCOUNT_ID` defaults to Trump's stable numeric id. Override it via a repo variable/secret if it ever changes.
 
 ## Schedule
 
