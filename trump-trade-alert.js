@@ -32,6 +32,9 @@ const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GE
 const STATE_FILE = process.env.STATE_FILE || "seen.json";
 const MAX_SEEN = 200;
 
+// Send a "no alerts" heartbeat when nothing is flagged? Default off to cut noise.
+const HEARTBEAT = /^(1|true|yes)$/i.test(process.env.HEARTBEAT || "");
+
 // ---------- Helpers ----------
 function toIST(date = new Date()) {
   return new Date(date).toLocaleString("en-IN", {
@@ -175,18 +178,60 @@ async function fetchRecentPosts() {
   return posts;
 }
 
-// ---------- 2. Classify each post via Gemini ----------
-async function classifyPost(post) {
-  const prompt = `You are a financial analyst checking a single Truth Social post by Donald Trump for market-moving signals.
+// ---------- 2. Analyze posts via Gemini (batched, with 429 backoff) ----------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-The post was published at: ${post.timeIST} IST. Use this EXACT time string in the output — do not invent a time.
+// Single Gemini call with retry/backoff. Throws an error with code "QUOTA"
+// if rate-limited (429) after all retries, so the caller can skip gracefully.
+async function geminiGenerate(prompt, { maxOutputTokens = 2000 } = {}) {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await fetch(GEMINI_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens, temperature: 0.1 },
+      }),
+    });
 
-POST:
-"""
-${post.text}
-"""
+    if (res.status === 429) {
+      if (attempt < maxAttempts) {
+        const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
+        const waitMs = (retryAfter > 0 ? retryAfter : attempt * 8) * 1000;
+        console.warn(`⏳ Gemini 429 — retrying in ${waitMs / 1000}s (attempt ${attempt}/${maxAttempts})`);
+        await sleep(waitMs);
+        continue;
+      }
+      const err = new Error("Gemini quota exceeded (429) after retries");
+      err.code = "QUOTA";
+      throw err;
+    }
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Gemini API error (HTTP ${res.status}): ${body.slice(0, 200)}`);
+    }
+    const data = await res.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
+  }
+  return "";
+}
 
-FLAG the post if it contains ANY of:
+// Analyze ALL fresh posts in one call. Returns an array of alert text blocks.
+async function analyzePosts(posts) {
+  const postsBlock = posts
+    .map((p, i) => `[POST ${i + 1}] published ${p.timeIST} IST\n${p.text}`)
+    .join("\n\n----------\n\n");
+
+  const prompt = `You are a financial analyst monitoring Donald Trump's Truth Social posts for market-moving signals.
+
+Below are ${posts.length} recent post(s). Each is labelled with its EXACT published time. Use that exact time string in the output — never invent a time.
+
+=== POSTS ===
+${postsBlock}
+=== END POSTS ===
+
+FLAG a post if it contains ANY of:
 - A specific company name or stock ticker
 - A specific industry or sector (steel, semiconductors, oil, pharma, banks, crypto, defense, autos, etc.)
 - Trade or tariff language (tariff, deal, trade, import, export, tax, sanction, duty)
@@ -194,35 +239,25 @@ FLAG the post if it contains ANY of:
 - Policy announcements that would directly affect publicly traded companies
 - Mentions of a major trading partner country (China, Canada, Mexico, EU, Japan, India, South Korea)
 
-If FLAGGED, respond in EXACTLY this format and nothing else:
+For EVERY flagged post, output this block (and nothing else around it):
 TRUMP TRADE ALERT
-Date & Time: ${post.timeIST} IST
-Post Summary: [one sentence summary of what he said]
+Date & Time: [the post's exact published time] IST
+Post Summary: [one sentence summary]
 Tickers Likely Affected: [comma-separated tickers if mentioned, else most likely affected based on context]
 Direction: [Bullish / Bearish / Mixed]
 Sector: [most affected sector]
 Confidence: [High / Medium / Low]
 Why It Matters: [one sentence on why this could move markets]
 
-If the post is NOT market-moving, respond with exactly: SKIP`;
+Separate multiple alert blocks with a line containing only: ===
+If NONE of the posts are market-moving, respond with exactly: NONE`;
 
-  const res = await fetch(GEMINI_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 600, temperature: 0.1 },
-    }),
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Gemini API error (HTTP ${res.status}): ${body.slice(0, 200)}`);
-  }
-  const data = await res.json();
-  const out = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
-  if (!out || /^skip\b/i.test(out)) return null;
-  if (!out.includes("TRUMP TRADE ALERT")) return null;
-  return out;
+  const out = await geminiGenerate(prompt, { maxOutputTokens: 2000 });
+  if (!out || /^none\b/i.test(out)) return [];
+  return out
+    .split(/^===$/m)
+    .map((s) => s.trim())
+    .filter((s) => s.includes("TRUMP TRADE ALERT"));
 }
 
 // ---------- 3. Push via ntfy ----------
@@ -259,22 +294,34 @@ async function main() {
     const fresh = posts.filter((p) => !seen.has(p.id));
     console.log(`🔎 ${fresh.length} new post(s) to analyze (${posts.length - fresh.length} already seen)`);
 
-    let alertCount = 0;
-    for (const post of fresh) {
-      const alert = await classifyPost(post);
-      seen.add(post.id); // mark processed regardless, so we never re-alert it
-      if (alert) {
-        alertCount++;
-        await sendNtfy({
-          title: "TRUMP TRADE ALERT",
-          body: alert,
-          priority: 5,
-          tags: "rotating_light,chart_with_upwards_trend",
-        });
+    let alerts = [];
+    if (fresh.length > 0) {
+      try {
+        alerts = await analyzePosts(fresh);
+        // Classification succeeded — mark all fresh posts processed.
+        fresh.forEach((p) => seen.add(p.id));
+      } catch (err) {
+        if (err.code === "QUOTA") {
+          // Don't mark these posts seen; next scheduled run retries them.
+          // Skip quietly (no scary alert, green exit) to avoid spam.
+          console.warn("⚠️ Gemini quota hit — skipping run, posts will be retried next time.");
+          saveSeen(seen);
+          return;
+        }
+        throw err;
       }
     }
 
-    if (alertCount === 0) {
+    for (const text of alerts) {
+      await sendNtfy({
+        title: "TRUMP TRADE ALERT",
+        body: text,
+        priority: 5,
+        tags: "rotating_light,chart_with_upwards_trend",
+      });
+    }
+
+    if (alerts.length === 0 && HEARTBEAT) {
       await sendNtfy({
         title: "Trump: No Market Alerts",
         body: `No alerts — nothing flagged in the last ${TIME_WINDOW} minutes.\n\nChecked: ${nowIST} IST`,
@@ -285,7 +332,7 @@ async function main() {
 
     saveSeen(seen);
     console.log("=".repeat(50));
-    console.log(`✅ Done. ${alertCount} alert(s) sent.\n`);
+    console.log(`✅ Done. ${alerts.length} alert(s) sent.\n`);
   } catch (err) {
     console.error("❌ Fatal error:", err.message);
     try {

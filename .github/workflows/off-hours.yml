@@ -33,6 +33,7 @@ jobs:
           NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           TIME_WINDOW: "120"
+          HEARTBEAT: ${{ secrets.HEARTBEAT }}
         run: node trump-trade-alert.js
       - name: Persist de-dup state
         if: always()

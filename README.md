@@ -23,6 +23,12 @@ GitHub, Cloudflare, Render and most cloud platforms run on data-center IPs that 
 
 `seen.json` stores the IDs of posts already alerted on (last 200). Each scheduled run commits it back to the repo via the workflow (needs `contents: write`, already set). This guarantees no repeat alerts across runs.
 
+## Rate limits & quiet mode
+
+- All new posts in a run are analyzed in a **single** Gemini call (not one per post), which keeps usage well under the free tier and avoids per-minute 429s during posting bursts.
+- On a 429, the script retries with backoff (honoring `Retry-After`). If it still fails, the run is skipped quietly and those posts are **not** marked seen — the next scheduled run retries them, so no alert is lost and you don't get a flood of error notifications.
+- The "No Market Alerts" heartbeat is **off by default** (quiet). Set a repo secret `HEARTBEAT=true` if you want a confirmation ping each run.
+
 ## Account id
 
 `TRUTH_ACCOUNT_ID` defaults to Trump's stable numeric id. Override it via a repo variable/secret if it ever changes.
