@@ -84,8 +84,45 @@ function saveSeen(seenSet) {
   }
 }
 
-// ---------- 1. Fetch posts via Tavily (Mastodon JSON API) ----------
+// ---------- 1. Fetch posts (multi-source with fallback) ----------
+// Order: direct raw fetch -> raw HTTP proxy -> Tavily. The first two return the
+// API's JSON body unmodified (clean parse). Tavily is the last resort because
+// it costs credits and reshapes the JSON (needs sanitizing).
+
+const BROWSER_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+  Accept: "application/json",
+};
+
+// Free raw proxy that returns the upstream body unchanged. Override or disable
+// (set PROXY_TEMPLATE="") via env. {url} is replaced with the encoded target.
+const PROXY_TEMPLATE =
+  process.env.PROXY_TEMPLATE || "https://api.allorigins.win/raw?url={url}";
+
+// Source order. Tavily works against Truth Social's Cloudflare protection;
+// direct/proxy are free fallbacks that only fire if earlier sources fail.
+// Reorder via env, e.g. FETCH_ORDER="proxy,tavily,direct".
+const FETCH_ORDER = (process.env.FETCH_ORDER || "tavily,proxy,direct")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+async function directFetch(url) {
+  const res = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error(`direct HTTP ${res.status}`);
+  return await res.text();
+}
+
+async function proxyFetch(url) {
+  const proxied = PROXY_TEMPLATE.replace("{url}", encodeURIComponent(url));
+  const res = await fetch(proxied, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(10000) });
+  if (!res.ok) throw new Error(`proxy HTTP ${res.status}`);
+  return await res.text();
+}
+
 async function tavilyExtract(url) {
+  if (!TAVILY_API_KEY) throw new Error("no Tavily key");
   const res = await fetch("https://api.tavily.com/extract", {
     method: "POST",
     headers: {
@@ -96,13 +133,11 @@ async function tavilyExtract(url) {
   });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Tavily extract failed (HTTP ${res.status}): ${body.slice(0, 200)}`);
+    throw new Error(`Tavily HTTP ${res.status}: ${body.slice(0, 120)}`);
   }
   const data = await res.json();
   const results = Array.isArray(data.results) ? data.results : [];
-  if (results.length === 0) {
-    throw new Error(`Tavily returned no content for ${url}`);
-  }
+  if (results.length === 0) throw new Error("Tavily returned no content");
   return results[0].raw_content || "";
 }
 
@@ -146,31 +181,55 @@ function sanitizeJsonControlChars(str) {
 }
 
 // Pull a JSON value (array or object) out of possibly-noisy extracted text.
+// Clean bodies (direct/proxy) parse straight through; the sanitizer only
+// matters for extractor-mangled content (Tavily).
 function extractJson(raw) {
   const text = String(raw).trim();
   const start = text.search(/[[{]/);
-  if (start === -1) throw new Error("No JSON found in Tavily content");
+  if (start === -1) throw new Error("no JSON found");
   const open = text[start];
   const close = open === "[" ? "]" : "}";
   const end = text.lastIndexOf(close);
-  if (end <= start) throw new Error("Malformed JSON in Tavily content");
-  const candidate = sanitizeJsonControlChars(text.slice(start, end + 1));
-  return JSON.parse(candidate);
+  if (end <= start) throw new Error("malformed JSON");
+  const slice = text.slice(start, end + 1);
+  try {
+    return JSON.parse(slice);
+  } catch (_) {
+    return JSON.parse(sanitizeJsonControlChars(slice));
+  }
 }
 
 async function fetchRecentPosts() {
-  // Keep limit small so the JSON isn't truncated by the extractor.
+  // Keep limit small so any extractor doesn't truncate the JSON.
   const url = `${TRUTH_BASE}/api/v1/accounts/${ACCOUNT_ID}/statuses?exclude_replies=true&limit=10`;
-  const raw = await tavilyExtract(url);
 
-  let statuses;
-  try {
-    statuses = extractJson(raw);
-  } catch (e) {
-    throw new Error(`Could not parse Truth Social statuses: ${e.message}`);
+  const sources = {
+    direct: directFetch,
+    proxy: proxyFetch,
+    tavily: tavilyExtract,
+  };
+
+  let statuses, lastErr;
+  for (const name of FETCH_ORDER) {
+    const fn = sources[name];
+    if (!fn) continue;
+    if (name === "proxy" && !PROXY_TEMPLATE) continue;
+    if (name === "tavily" && !TAVILY_API_KEY) continue;
+    try {
+      const raw = await fn(url);
+      const parsed = extractJson(raw);
+      if (!Array.isArray(parsed)) throw new Error("payload is not an array");
+      statuses = parsed;
+      console.log(`✔ Source: ${name}`);
+      break;
+    } catch (e) {
+      console.warn(`↪ source "${name}" failed: ${e.message}`);
+      lastErr = e;
+    }
   }
-  if (!Array.isArray(statuses)) {
-    throw new Error(`Unexpected statuses payload: ${JSON.stringify(statuses).slice(0, 200)}`);
+
+  if (!statuses) {
+    throw new Error(`All sources failed to return Truth Social statuses. Last: ${lastErr?.message}`);
   }
 
   const cutoff = Date.now() - TIME_WINDOW * 60 * 1000;

@@ -15,6 +15,17 @@ Gemini Flash → classifies each NEW post as market-moving or not
 ntfy.sh → push notification to your phone
 ```
 
+## Data source & fallback chain
+
+Truth Social's Mastodon API sits behind Cloudflare bot protection, which 403s direct requests (even from residential IPs) and breaks most free proxies. **Tavily** (residential proxy + browser engine) is the only source that reliably gets through, so it's the primary source.
+
+The script tries sources in `FETCH_ORDER` (default `tavily,proxy,direct`) and uses the first that returns a parseable statuses array:
+- **tavily** — reliable; reshapes the JSON, so the built-in sanitizer repairs control chars and invalid escape sequences before parsing.
+- **proxy** — a raw HTTP proxy (`PROXY_TEMPLATE`, default allorigins). Returns the body unmodified when it works, but free proxies are flaky/blocked. Only fires if Tavily fails.
+- **direct** — plain fetch; works only if Cloudflare ever stops blocking (e.g. self-host scenarios). Last resort.
+
+To prioritise a working proxy (and save Tavily credits), set `FETCH_ORDER=proxy,tavily`. To disable the proxy, set `PROXY_TEMPLATE=` (empty).
+
 ## Why Tavily + the JSON API
 
 GitHub, Cloudflare, Render and most cloud platforms run on data-center IPs that Truth Social blocks (HTTP 403). Tavily fetches through residential proxies, so it reaches the content. We point Tavily at Truth Social's underlying **Mastodon JSON API** (`/api/v1/accounts/{id}/statuses`) rather than the HTML page, so every post comes with a real `created_at` timestamp and a stable `id`. That lets the code — not the LLM — decide what's recent and stamp the correct time, and lets us de-dupe so the same post is never alerted twice. Tavily free tier: 1,000 credits/month.
