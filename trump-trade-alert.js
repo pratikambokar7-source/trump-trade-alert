@@ -106,20 +106,34 @@ async function tavilyExtract(url) {
   return results[0].raw_content || "";
 }
 
-// Escape raw control characters that appear INSIDE JSON string literals.
-// Tavily decodes escaped \n/\t into literal newlines/tabs, which strict
-// JSON.parse rejects. We re-escape only chars inside strings, leaving
-// structural whitespace (between tokens) untouched.
+// Repair JSON that a web extractor mangled: inside string literals, escape raw
+// control characters AND fix invalid escape sequences (e.g. markdown "\." or a
+// lone "\"). Structural whitespace between tokens is left untouched.
 function sanitizeJsonControlChars(str) {
+  const validEscape = new Set(['"', "\\", "/", "b", "f", "n", "r", "t", "u"]);
   let out = "";
   let inString = false;
-  let escaped = false;
-  for (const ch of str) {
-    if (escaped) { out += ch; escaped = false; continue; }
-    if (ch === "\\") { out += ch; escaped = true; continue; }
-    if (ch === '"') { inString = !inString; out += ch; continue; }
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (!inString) {
+      out += ch;
+      if (ch === '"') inString = true;
+      continue;
+    }
+    // Inside a string literal:
+    if (ch === '"') { out += ch; inString = false; continue; }
+    if (ch === "\\") {
+      const next = str[i + 1];
+      if (next !== undefined && validEscape.has(next)) {
+        out += ch + next; // valid escape — keep the pair as-is
+        i++;
+      } else {
+        out += "\\\\"; // invalid escape — escape the backslash itself
+      }
+      continue;
+    }
     const code = ch.charCodeAt(0);
-    if (inString && code < 0x20) {
+    if (code < 0x20) {
       if (ch === "\n") out += "\\n";
       else if (ch === "\r") out += "\\r";
       else if (ch === "\t") out += "\\t";
