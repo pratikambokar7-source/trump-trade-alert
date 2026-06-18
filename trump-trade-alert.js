@@ -1,7 +1,7 @@
 // trump-trade-alert.js
-// Pipeline: Tavily (fetch Truth Social Mastodon API JSON) -> filter+timestamp in
-// code -> Gemini (classify market-moving) -> ntfy (push). De-dupes by post id.
-// Zero dependencies. Native fetch (Node 20+).
+// Pipeline: source (Tavily/proxy/direct) -> filter+timestamp in code ->
+// Gemini (classify market-moving) -> ntfy (push). Watermark + de-dup ensure
+// no post is missed and none is alerted twice. Zero deps. Native fetch (Node 20+).
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 
@@ -9,30 +9,22 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
-// ntfy server (default public). Point to your self-hosted instance if you have one.
 const NTFY_SERVER = (process.env.NTFY_SERVER || "https://ntfy.sh").replace(/\/+$/, "");
-// Optional access token for an access-controlled / reserved topic (ntfy Pro or
-// self-hosted with auth). When set, publishing is authenticated.
 const NTFY_TOKEN = process.env.NTFY_TOKEN || "";
 
-// Look-back window in minutes. Workflows pass 45 (market hours) / 120 (off hours).
+// First-run look-back bound (minutes). After that, the watermark drives things.
 const TIME_WINDOW = parseInt(process.env.TIME_WINDOW || "120", 10);
 
-// Truth Social account to monitor (Mastodon-compatible API).
 const TRUTH_BASE = "https://truthsocial.com";
 const ACCOUNT = process.env.TRUTH_ACCOUNT || "realDonaldTrump";
-// Trump's stable numeric account id (override via env if it ever changes).
 const ACCOUNT_ID = process.env.TRUTH_ACCOUNT_ID || "107780257626128497";
 
-// Free-tier model (2026): gemini-2.5-flash-lite has the highest free quota.
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
-// Cross-run de-dup state (committed back by the workflow).
 const STATE_FILE = process.env.STATE_FILE || "seen.json";
 const MAX_SEEN = 200;
 
-// Send a "no alerts" heartbeat when nothing is flagged? Default off to cut noise.
 const HEARTBEAT = /^(1|true|yes)$/i.test(process.env.HEARTBEAT || "");
 
 // ---------- Helpers ----------
@@ -58,51 +50,48 @@ function cleanContent(html = "") {
     .replace(/<\/p>/gi, "\n")
     .replace(/<a[^>]*href="([^"]*)"[^>]*>(.*?)<\/a>/gi, "$2 ($1)")
     .replace(/<[^>]+>/g, "")
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
+    .replace(/&/g, "&").replace(/</g, "<").replace(/&gt;/g, ">")
+    .replace(/"/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
     .replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
 }
 
-function loadSeen() {
+// State = { lastMs, seen[] }. lastMs is the watermark: created_at (ms) of the
+// newest post already processed. Each run handles everything newer than it, so
+// no post is missed regardless of the gap. seen[] prevents duplicate alerts.
+function loadState() {
   try {
     if (existsSync(STATE_FILE)) {
-      const arr = JSON.parse(readFileSync(STATE_FILE, "utf8"));
-      if (Array.isArray(arr)) return new Set(arr.map(String));
+      const data = JSON.parse(readFileSync(STATE_FILE, "utf8"));
+      if (Array.isArray(data)) return { seen: new Set(data.map(String)), lastMs: 0 };
+      if (data && typeof data === "object") {
+        return { seen: new Set((data.seen || []).map(String)), lastMs: Number(data.lastMs) || 0 };
+      }
     }
   } catch (e) {
     console.warn(`⚠️ Could not read ${STATE_FILE}: ${e.message}`);
   }
-  return new Set();
+  return { seen: new Set(), lastMs: 0 };
 }
 
-function saveSeen(seenSet) {
+function saveState(seenSet, lastMs) {
   try {
-    const arr = [...seenSet].slice(-MAX_SEEN);
-    writeFileSync(STATE_FILE, JSON.stringify(arr, null, 0));
+    const seen = [...seenSet].slice(-MAX_SEEN);
+    writeFileSync(STATE_FILE, JSON.stringify({ lastMs, seen }, null, 0));
   } catch (e) {
     console.warn(`⚠️ Could not write ${STATE_FILE}: ${e.message}`);
   }
 }
 
 // ---------- 1. Fetch posts (multi-source with fallback) ----------
-// Order: direct raw fetch -> raw HTTP proxy -> Tavily. The first two return the
-// API's JSON body unmodified (clean parse). Tavily is the last resort because
-// it costs credits and reshapes the JSON (needs sanitizing).
-
 const BROWSER_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
   Accept: "application/json",
 };
 
-// Free raw proxy that returns the upstream body unchanged. Override or disable
-// (set PROXY_TEMPLATE="") via env. {url} is replaced with the encoded target.
 const PROXY_TEMPLATE =
   process.env.PROXY_TEMPLATE || "https://api.allorigins.win/raw?url={url}";
 
-// Source order. Tavily works against Truth Social's Cloudflare protection;
-// direct/proxy are free fallbacks that only fire if earlier sources fail.
-// Reorder via env, e.g. FETCH_ORDER="proxy,tavily,direct".
 const FETCH_ORDER = (process.env.FETCH_ORDER || "tavily,proxy,direct")
   .split(",")
   .map((s) => s.trim().toLowerCase())
@@ -141,9 +130,6 @@ async function tavilyExtract(url) {
   return results[0].raw_content || "";
 }
 
-// Repair JSON that a web extractor mangled: inside string literals, escape raw
-// control characters AND fix invalid escape sequences (e.g. markdown "\." or a
-// lone "\"). Structural whitespace between tokens is left untouched.
 function sanitizeJsonControlChars(str) {
   const validEscape = new Set(['"', "\\", "/", "b", "f", "n", "r", "t", "u"]);
   let out = "";
@@ -155,15 +141,14 @@ function sanitizeJsonControlChars(str) {
       if (ch === '"') inString = true;
       continue;
     }
-    // Inside a string literal:
     if (ch === '"') { out += ch; inString = false; continue; }
     if (ch === "\\") {
       const next = str[i + 1];
       if (next !== undefined && validEscape.has(next)) {
-        out += ch + next; // valid escape — keep the pair as-is
+        out += ch + next;
         i++;
       } else {
-        out += "\\\\"; // invalid escape — escape the backslash itself
+        out += "\\\\";
       }
       continue;
     }
@@ -180,9 +165,6 @@ function sanitizeJsonControlChars(str) {
   return out;
 }
 
-// Pull a JSON value (array or object) out of possibly-noisy extracted text.
-// Clean bodies (direct/proxy) parse straight through; the sanitizer only
-// matters for extractor-mangled content (Tavily).
 function extractJson(raw) {
   const text = String(raw).trim();
   const start = text.search(/[[{]/);
@@ -200,14 +182,9 @@ function extractJson(raw) {
 }
 
 async function fetchRecentPosts() {
-  // Keep limit small so any extractor doesn't truncate the JSON.
-  const url = `${TRUTH_BASE}/api/v1/accounts/${ACCOUNT_ID}/statuses?exclude_replies=true&limit=10`;
+  const url = `${TRUTH_BASE}/api/v1/accounts/${ACCOUNT_ID}/statuses?exclude_replies=true&limit=20`;
 
-  const sources = {
-    direct: directFetch,
-    proxy: proxyFetch,
-    tavily: tavilyExtract,
-  };
+  const sources = { direct: directFetch, proxy: proxyFetch, tavily: tavilyExtract };
 
   let statuses, lastErr;
   for (const name of FETCH_ORDER) {
@@ -232,11 +209,10 @@ async function fetchRecentPosts() {
     throw new Error(`All sources failed to return Truth Social statuses. Last: ${lastErr?.message}`);
   }
 
-  const cutoff = Date.now() - TIME_WINDOW * 60 * 1000;
   const posts = statuses
     .filter((s) => s && s.created_at && s.id)
     .map((s) => {
-      const main = s.reblog || s; // surface reposted content
+      const main = s.reblog || s;
       return {
         id: String(s.id),
         createdMs: new Date(s.created_at).getTime(),
@@ -245,17 +221,15 @@ async function fetchRecentPosts() {
         reposted: Boolean(s.reblog),
       };
     })
-    .filter((p) => p.text && Number.isFinite(p.createdMs) && p.createdMs >= cutoff);
+    .filter((p) => p.text && Number.isFinite(p.createdMs));
 
-  console.log(`✔ Fetched ${statuses.length} statuses — ${posts.length} within last ${TIME_WINDOW} min`);
+  console.log(`✔ Fetched ${statuses.length} statuses (${posts.length} usable)`);
   return posts;
 }
 
-// ---------- 2. Analyze posts via Gemini (batched, with 429 backoff) ----------
+// ---------- 2. Analyze posts via Gemini (batched, retry on 429/5xx) ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Single Gemini call with retry/backoff. Throws an error with code "QUOTA"
-// if rate-limited (429) after all retries, so the caller can skip gracefully.
 async function geminiGenerate(prompt, { maxOutputTokens = 2000 } = {}) {
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -268,16 +242,17 @@ async function geminiGenerate(prompt, { maxOutputTokens = 2000 } = {}) {
       }),
     });
 
-    if (res.status === 429) {
+    // 429 = rate limit; 5xx = temporary model overload/outage. Both transient.
+    if ([429, 500, 502, 503, 504].includes(res.status)) {
       if (attempt < maxAttempts) {
         const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
         const waitMs = (retryAfter > 0 ? retryAfter : attempt * 8) * 1000;
-        console.warn(`⏳ Gemini 429 — retrying in ${waitMs / 1000}s (attempt ${attempt}/${maxAttempts})`);
+        console.warn(`⏳ Gemini ${res.status} — retrying in ${waitMs / 1000}s (attempt ${attempt}/${maxAttempts})`);
         await sleep(waitMs);
         continue;
       }
-      const err = new Error("Gemini quota exceeded (429) after retries");
-      err.code = "QUOTA";
+      const err = new Error(`Gemini transient error (HTTP ${res.status}) after retries`);
+      err.code = "TRANSIENT";
       throw err;
     }
     if (!res.ok) {
@@ -290,7 +265,6 @@ async function geminiGenerate(prompt, { maxOutputTokens = 2000 } = {}) {
   return "";
 }
 
-// Analyze ALL fresh posts in one call. Returns an array of alert text blocks.
 async function analyzePosts(posts) {
   const postsBlock = posts
     .map((p, i) => `[POST ${i + 1}] published ${p.timeIST} IST\n${p.text}`)
@@ -343,11 +317,7 @@ async function sendNtfy({ title, body, priority, tags }) {
     Tags: tags,
   };
   if (NTFY_TOKEN) headers.Authorization = `Bearer ${NTFY_TOKEN}`;
-  const res = await fetch(`${NTFY_SERVER}/${NTFY_TOPIC}`, {
-    method: "POST",
-    headers,
-    body,
-  });
+  const res = await fetch(`${NTFY_SERVER}/${NTFY_TOPIC}`, { method: "POST", headers, body });
   if (!res.ok) throw new Error(`ntfy failed (HTTP ${res.status})`);
   console.log(`📲 Sent: "${safeTitle}"`);
 }
@@ -355,30 +325,36 @@ async function sendNtfy({ title, body, priority, tags }) {
 // ---------- Main ----------
 async function main() {
   const nowIST = toIST();
-  console.log(`\n🚀 Trump Trade Alert — ${nowIST} IST (window: ${TIME_WINDOW} min)`);
+  console.log(`\n🚀 Trump Trade Alert — ${nowIST} IST`);
   console.log("=".repeat(50));
 
   try {
     checkEnv();
-    const seen = loadSeen();
+    const { seen, lastMs } = loadState();
     const posts = await fetchRecentPosts();
 
-    // Only analyze posts we haven't already alerted on.
-    const fresh = posts.filter((p) => !seen.has(p.id));
-    console.log(`🔎 ${fresh.length} new post(s) to analyze (${posts.length - fresh.length} already seen)`);
+    // Floor = watermark of last processed post. First ever run (no watermark)
+    // falls back to the TIME_WINDOW bound so we don't alert on ancient history.
+    const floorMs = lastMs > 0 ? lastMs : Date.now() - TIME_WINDOW * 60 * 1000;
+    const fresh = posts
+      .filter((p) => p.createdMs > floorMs && !seen.has(p.id))
+      .sort((a, b) => a.createdMs - b.createdMs);
+
+    console.log(`🔎 ${fresh.length} new post(s) since ${toIST(floorMs)} IST`);
 
     let alerts = [];
+    let newLastMs = lastMs;
     if (fresh.length > 0) {
       try {
         alerts = await analyzePosts(fresh);
-        // Classification succeeded — mark all fresh posts processed.
         fresh.forEach((p) => seen.add(p.id));
+        newLastMs = Math.max(lastMs, ...fresh.map((p) => p.createdMs));
       } catch (err) {
-        if (err.code === "QUOTA") {
-          // Don't mark these posts seen; next scheduled run retries them.
-          // Skip quietly (no scary alert, green exit) to avoid spam.
-          console.warn("⚠️ Gemini quota hit — skipping run, posts will be retried next time.");
-          saveSeen(seen);
+        if (err.code === "TRANSIENT") {
+          // Don't advance watermark or mark seen — next run retries these exact
+          // posts. No lost alerts, no error-notification spam.
+          console.warn(`⚠️ ${err.message} — skipping, will retry next run.`);
+          saveState(seen, lastMs);
           return;
         }
         throw err;
@@ -397,13 +373,13 @@ async function main() {
     if (alerts.length === 0 && HEARTBEAT) {
       await sendNtfy({
         title: "Trump: No Market Alerts",
-        body: `No alerts — nothing flagged in the last ${TIME_WINDOW} minutes.\n\nChecked: ${nowIST} IST`,
+        body: `No new market-moving posts.\n\nChecked: ${nowIST} IST`,
         priority: 1,
         tags: "white_check_mark",
       });
     }
 
-    saveSeen(seen);
+    saveState(seen, newLastMs);
     console.log("=".repeat(50));
     console.log(`✅ Done. ${alerts.length} alert(s) sent.\n`);
   } catch (err) {
